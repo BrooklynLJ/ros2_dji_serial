@@ -18,26 +18,44 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
+
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
 #include "ros2_serial_example/transporter.hpp"
 
 // ── Concrete in-process transporter for testing ──────────────────────────────
-// node_write() captures bytes into a vector so tests can inspect the wire data.
-// node_read() pushes a pre-loaded rx_data_ vector into the ring buffer.
+//
+// The RingBuffer only accepts data via read(int fd), so we maintain a pipe.
+// node_read() writes rx_data_ into the write-end of the pipe, then calls
+// ringbuf_.read() on the read-end so the data lands in the ring buffer.
+// node_write() captures the framed bytes into written_data for inspection.
 
 class TransporterPassThrough final : public ros2_to_serial_bridge::transport::Transporter
 {
 public:
-    explicit TransporterPassThrough(size_t ring_buffer_size = 1024)
-    : Transporter(ring_buffer_size) {}
+    explicit TransporterPassThrough(size_t ring_buffer_size = 4096)
+    : Transporter(ring_buffer_size)
+    {
+        if (::pipe(pipe_fds_) < 0)
+        {
+            throw std::runtime_error("pipe() failed in TransporterPassThrough");
+        }
+    }
 
-    // Data written by the Transporter's write() path ends up here.
+    ~TransporterPassThrough() override
+    {
+        ::close(pipe_fds_[0]);
+        ::close(pipe_fds_[1]);
+    }
+
+    // Bytes written by Transporter::write() accumulate here for assertions.
     std::vector<uint8_t> written_data;
 
-    // Bytes to be fed into the ring buffer on the next node_read() call.
+    // Populate this before calling read(); node_read() will push it into the ring.
     std::vector<uint8_t> rx_data;
 
 protected:
@@ -51,38 +69,51 @@ protected:
     ssize_t node_read() override
     {
         if (rx_data.empty()) { return 0; }
-        ssize_t n = ringbuf_.write(rx_data.data(), rx_data.size());
+
+        // Write all rx bytes into the pipe write-end.
+        ssize_t written = ::write(pipe_fds_[1], rx_data.data(), rx_data.size());
         rx_data.clear();
-        return n;
+        if (written < 0) { return -1; }
+
+        // Drain the pipe read-end into the ring buffer.
+        ssize_t total = 0;
+        ssize_t n;
+        while ((n = ringbuf_.read(pipe_fds_[0])) > 0)
+        {
+            total += n;
+        }
+        return total;
     }
 
     bool fds_OK() override { return true; }
+
+private:
+    int pipe_fds_[2]{-1, -1};
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Build a valid DJI frame by hand so we can feed it to find_and_copy_message.
+// Build a valid DJI frame matching the wire layout exactly:
+//   [0xA5][dataLen_L][dataLen_H][seq][crc8][msgType_L][msgType_H][payload...][crc16_L][crc16_H]
 static std::vector<uint8_t> make_dji_frame(uint16_t msg_type,
-                                            uint8_t seq,
+                                            uint8_t  seq,
                                             const std::vector<uint8_t> & payload)
 {
-    // Header fields
-    uint8_t  head       = 0xA5;
     uint16_t dataLength = static_cast<uint16_t>(payload.size());
 
-    // Build raw header bytes (head, dataLen_L, dataLen_H, seq) for CRC8
-    uint8_t pre_crc[4];
-    pre_crc[0] = head;
-    pre_crc[1] = static_cast<uint8_t>(dataLength & 0xFF);
-    pre_crc[2] = static_cast<uint8_t>((dataLength >> 8) & 0xFF);
-    pre_crc[3] = seq;
-
+    // The 4 bytes covered by CRC8: head, dataLen_L, dataLen_H, seq
+    uint8_t pre_crc[4] = {
+        0xA5,
+        static_cast<uint8_t>(dataLength & 0xFF),
+        static_cast<uint8_t>((dataLength >> 8) & 0xFF),
+        seq
+    };
     uint8_t crc8 = calculateCRC8(pre_crc, 4);
 
     std::vector<uint8_t> frame;
-    frame.push_back(head);
-    frame.push_back(pre_crc[1]);   // dataLen L
-    frame.push_back(pre_crc[2]);   // dataLen H
+    frame.push_back(0xA5);
+    frame.push_back(pre_crc[1]);
+    frame.push_back(pre_crc[2]);
     frame.push_back(seq);
     frame.push_back(crc8);
     frame.push_back(static_cast<uint8_t>(msg_type & 0xFF));
@@ -95,17 +126,16 @@ static std::vector<uint8_t> make_dji_frame(uint16_t msg_type,
     return frame;
 }
 
-// ── Tests: Transporter::write() (TX path) ─────────────────────────────────────
+// ── TX path tests: Transporter::write() ──────────────────────────────────────
 
 TEST(TransporterWrite, EmptyPayload)
 {
     TransporterPassThrough t;
     ssize_t ret = t.write(42, nullptr, 0);
     ASSERT_EQ(ret, 0);
-
-    // Frame should be 7 (header) + 0 (payload) + 2 (CRC16) = 9 bytes
+    // 7-byte header + 0 payload + 2-byte CRC16 = 9 bytes on the wire
     ASSERT_EQ(t.written_data.size(), 9u);
-    ASSERT_EQ(t.written_data[0], 0xA5u);  // SOF
+    ASSERT_EQ(t.written_data[0], 0xA5u);
 }
 
 TEST(TransporterWrite, SmallPayload)
@@ -115,16 +145,16 @@ TEST(TransporterWrite, SmallPayload)
     ssize_t ret = t.write(7, payload.data(), payload.size());
     ASSERT_EQ(ret, static_cast<ssize_t>(payload.size()));
 
-    // Total: 7 + 4 + 2 = 13 bytes
+    // 7 + 4 + 2 = 13 bytes
     ASSERT_EQ(t.written_data.size(), 13u);
     ASSERT_EQ(t.written_data[0], 0xA5u);
 
-    // dataLength field (bytes 1-2, LE) == 4
+    // dataLength (bytes 1-2, LE) == 4
     uint16_t dlen = static_cast<uint16_t>(t.written_data[1]) |
                     (static_cast<uint16_t>(t.written_data[2]) << 8);
     ASSERT_EQ(dlen, 4u);
 
-    // msgType field (bytes 5-6, LE) == 7
+    // msgType (bytes 5-6, LE) == 7
     uint16_t mtype = static_cast<uint16_t>(t.written_data[5]) |
                      (static_cast<uint16_t>(t.written_data[6]) << 8);
     ASSERT_EQ(mtype, 7u);
@@ -137,9 +167,9 @@ TEST(TransporterWrite, CRC8IsValid)
     t.write(1, payload.data(), payload.size());
 
     const auto & d = t.written_data;
-    // CRC8 should cover first 4 bytes (head, dataLen_L, dataLen_H, seq)
-    uint8_t expected_crc8 = calculateCRC8(d.data(), 4);
-    ASSERT_EQ(d[4], expected_crc8);
+    // CRC8 covers the first 4 bytes (head, dataLen_L, dataLen_H, seq)
+    uint8_t expected = calculateCRC8(d.data(), 4);
+    ASSERT_EQ(d[4], expected);
 }
 
 TEST(TransporterWrite, CRC16IsValid)
@@ -149,11 +179,11 @@ TEST(TransporterWrite, CRC16IsValid)
     t.write(5, payload.data(), payload.size());
 
     const auto & d = t.written_data;
-    size_t frame_body_len = d.size() - 2;  // everything before CRC16 bytes
-    uint16_t expected_crc16 = calculateCRC16(d.data(), frame_body_len);
-    uint16_t written_crc16 = static_cast<uint16_t>(d[frame_body_len]) |
-                             (static_cast<uint16_t>(d[frame_body_len + 1]) << 8);
-    ASSERT_EQ(written_crc16, expected_crc16);
+    size_t body_len = d.size() - 2;
+    uint16_t expected = calculateCRC16(d.data(), body_len);
+    uint16_t actual   = static_cast<uint16_t>(d[body_len]) |
+                        (static_cast<uint16_t>(d[body_len + 1]) << 8);
+    ASSERT_EQ(actual, expected);
 }
 
 TEST(TransporterWrite, SequenceIncrements)
@@ -164,28 +194,26 @@ TEST(TransporterWrite, SequenceIncrements)
     t.write(1, payload.data(), payload.size());
     t.write(1, payload.data(), payload.size());
 
-    // seq is byte 3 of each 10-byte frame (7 hdr + 1 payload + 2 crc)
+    // Each frame is 10 bytes (7 hdr + 1 payload + 2 CRC16); seq is byte 3
     ASSERT_EQ(t.written_data[3],  0u);
     ASSERT_EQ(t.written_data[13], 1u);
     ASSERT_EQ(t.written_data[23], 2u);
 }
 
-// ── Tests: Transporter::read() (RX path) ──────────────────────────────────────
+// ── RX path tests: Transporter::read() ───────────────────────────────────────
 
 TEST(TransporterRead, ValidFrame)
 {
     TransporterPassThrough t;
     std::vector<uint8_t> payload = {0xAA, 0xBB, 0xCC};
-    uint16_t msg_type = 3;
-
-    t.rx_data = make_dji_frame(msg_type, 0, payload);
+    t.rx_data = make_dji_frame(3, 0, payload);
 
     uint8_t out[64];
     topic_id_size_t topic_id = 0xFFFF;
     ssize_t len = t.read(&topic_id, out, sizeof(out));
 
     ASSERT_EQ(len, static_cast<ssize_t>(payload.size()));
-    ASSERT_EQ(topic_id, msg_type);
+    ASSERT_EQ(topic_id, 3u);
     ASSERT_EQ(out[0], 0xAAu);
     ASSERT_EQ(out[1], 0xBBu);
     ASSERT_EQ(out[2], 0xCCu);
@@ -207,11 +235,10 @@ TEST(TransporterRead, EmptyPayloadFrame)
 TEST(TransporterRead, GarbageBeforeSOF)
 {
     TransporterPassThrough t;
-    std::vector<uint8_t> payload = {0x42};
-    auto frame = make_dji_frame(2, 0, payload);
+    auto frame = make_dji_frame(2, 0, {0x42});
 
-    // Prepend garbage bytes
-    t.rx_data.insert(t.rx_data.end(), {0x00, 0xFF, 0x12, 0x34});
+    // Prepend garbage bytes that don't look like a valid SOF
+    t.rx_data = {0x00, 0xFF, 0x12, 0x34};
     t.rx_data.insert(t.rx_data.end(), frame.begin(), frame.end());
 
     uint8_t out[64];
@@ -244,7 +271,7 @@ TEST(TransporterRead, BadCRC16Rejected)
     TransporterPassThrough t;
     auto frame = make_dji_frame(1, 0, {0x01, 0x02});
 
-    // Corrupt the last byte (CRC16 MSB)
+    // Corrupt the CRC16 MSB (last byte)
     frame.back() ^= 0xFF;
     t.rx_data = frame;
 
@@ -260,14 +287,14 @@ TEST(TransporterRead, PartialFrameReturnsNoData)
     TransporterPassThrough t;
     auto frame = make_dji_frame(5, 0, {0xDE, 0xAD, 0xBE, 0xEF});
 
-    // Feed only the header (no payload, no CRC16)
+    // Feed only the 7-byte header — no payload, no CRC16
     t.rx_data.assign(frame.begin(), frame.begin() + 7);
 
     uint8_t out[64];
     topic_id_size_t topic_id = 0xFFFF;
     ssize_t len = t.read(&topic_id, out, sizeof(out));
 
-    ASSERT_LT(len, 0);  // -ENODATA
+    ASSERT_LT(len, 0);
 }
 
 TEST(TransporterRead, TwoConsecutiveFrames)
@@ -287,6 +314,7 @@ TEST(TransporterRead, TwoConsecutiveFrames)
     ASSERT_EQ(topic_id, 10u);
     ASSERT_EQ(out[0], 0x01u);
 
+    // Second frame is already in the ring buffer — no new rx_data needed
     ssize_t len2 = t.read(&topic_id, out, sizeof(out));
     ASSERT_EQ(len2, 2);
     ASSERT_EQ(topic_id, 20u);
@@ -294,7 +322,7 @@ TEST(TransporterRead, TwoConsecutiveFrames)
     ASSERT_EQ(out[1], 0x03u);
 }
 
-// ── Tests: round-trip write → read ────────────────────────────────────────────
+// ── Round-trip: write() → read() ─────────────────────────────────────────────
 
 TEST(TransporterRoundTrip, WriteAndReadBack)
 {
@@ -306,7 +334,7 @@ TEST(TransporterRoundTrip, WriteAndReadBack)
 
     tx.write(msg_type, payload.data(), payload.size());
 
-    // Feed the bytes tx produced directly into rx's receive path
+    // Feed the raw bytes tx produced directly into rx's receive path
     rx.rx_data = tx.written_data;
 
     uint8_t out[64];
@@ -323,7 +351,7 @@ TEST(TransporterRoundTrip, WriteAndReadBack)
 
 TEST(TransporterRoundTrip, LargePayload)
 {
-    TransporterPassThrough tx;
+    TransporterPassThrough tx(16384);
     TransporterPassThrough rx(16384);
 
     std::vector<uint8_t> payload(512);
