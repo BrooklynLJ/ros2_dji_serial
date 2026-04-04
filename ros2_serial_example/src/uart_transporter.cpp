@@ -102,11 +102,10 @@ uint32_t baud_number_to_rate(uint32_t baud)
 }
 
 UARTTransporter::UARTTransporter(const std::string & uart_name,
-                                 const std::string & protocol,
                                  uint32_t baudrate,
                                  uint32_t read_poll_ms,
                                  size_t ring_buffer_size):
-    Transporter(protocol, ring_buffer_size),
+    Transporter(ring_buffer_size),
     uart_name_(uart_name),
     read_poll_ms_(read_poll_ms)
 {

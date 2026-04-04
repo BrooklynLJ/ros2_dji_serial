@@ -43,7 +43,6 @@ ROS2ToSerialBridge::ROS2ToSerialBridge(const rclcpp::NodeOptions& node_options)
 {
     std::string backend_comms{};
     std::string device{};
-    std::string backend_protocol{};
     uint32_t baudrate;
     int64_t dynamic_serial_mapping_ms{-1};
     uint32_t read_poll_ms;
@@ -54,11 +53,6 @@ ROS2ToSerialBridge::ROS2ToSerialBridge(const rclcpp::NodeOptions& node_options)
     if (!get_parameter("backend_comms", backend_comms))
     {
       throw std::runtime_error("No backend comms type specified, cannot continue");
-    }
-
-    if (!get_parameter("backend_protocol", backend_protocol))
-    {
-        throw std::runtime_error("No backend_protocol specified, cannot continue");
     }
 
     if (!get_parameter("dynamic_serial_mapping_ms", dynamic_serial_mapping_ms))
@@ -89,7 +83,6 @@ ROS2ToSerialBridge::ROS2ToSerialBridge(const rclcpp::NodeOptions& node_options)
         }
 
         transporter_ = std::make_unique<ros2_to_serial_bridge::transport::UARTTransporter>(device,
-                                                                                           backend_protocol,
                                                                                            baudrate,
                                                                                            read_poll_ms,
                                                                                            ring_buffer_size);
@@ -106,8 +99,7 @@ ROS2ToSerialBridge::ROS2ToSerialBridge(const rclcpp::NodeOptions& node_options)
           throw std::runtime_error("No udp_send_port parameter specified, cannot continue");
         }
 
-        transporter_ = std::make_unique<ros2_to_serial_bridge::transport::UDPTransporter>(backend_protocol,
-                                                                                          udp_recv_port,
+        transporter_ = std::make_unique<ros2_to_serial_bridge::transport::UDPTransporter>(udp_recv_port,
                                                                                           udp_send_port,
                                                                                           read_poll_ms,
                                                                                           ring_buffer_size);

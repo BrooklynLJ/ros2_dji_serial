@@ -46,9 +46,6 @@ ros2_to_serial_bridge:
                                        # failing.  If this config is >= 0, then
                                        # any topics configured below will be
                                        # ignored.
-        backend_protocol: px4          # The backend protocol to use.  Currently
-                                       # available protocols are 'px4'
-                                       # and 'cobs'.
         topics:                        # The list of topics to map; only used
                                        # if dynamic_serial_mapping_ms is < 0.
 

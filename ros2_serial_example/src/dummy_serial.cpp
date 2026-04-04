@@ -39,9 +39,7 @@ static void usage(const char *name)
     ::printf("Usage: %s [options]\n\n"
              "  -b <baudrate> Baudrate to use for the device\n"
              "  -d <device>   UART device; must be specified\n"
-             "  -h            Print this help message\n"
-             "  -s <protocol> Serial protocol to use; currently supported are\n"
-             "                'cobs' (default) and 'px4'\n",
+             "  -h            Print this help message\n",
              name);
 }
 
@@ -113,10 +111,10 @@ int main(int argc, char *argv[])
 {
     std::string device{};
     uint32_t baudrate = 0;
-    std::string serial_protocol{"cobs"};
+
 
     int ch;
-    while ((ch = ::getopt(argc, argv, "b:d:hs:")) != EOF)
+    while ((ch = ::getopt(argc, argv, "b:d:h")) != EOF)
     {
         switch (ch)
         {
@@ -147,12 +145,7 @@ int main(int argc, char *argv[])
         case 'h':
             usage(argv[0]);
             return 0;
-        case 's':
-            if (optarg != nullptr)
-            {
-                serial_protocol = optarg;
-            }
-            break;
+
         default:
             usage(argv[0]);
             return 1;
@@ -172,7 +165,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::unique_ptr<ros2_to_serial_bridge::transport::Transporter> transporter = std::make_unique<ros2_to_serial_bridge::transport::UARTTransporter>(device, serial_protocol, baudrate, 100, 8192);
+    std::unique_ptr<ros2_to_serial_bridge::transport::Transporter> transporter = std::make_unique<ros2_to_serial_bridge::transport::UARTTransporter>(device, baudrate, 100, 8192);
 
     if (transporter->init() < 0)
     {

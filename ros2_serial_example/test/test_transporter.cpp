@@ -1,488 +1,342 @@
-#include <gtest/gtest.h>
+// Copyright 2019 Open Source Robotics Foundation, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Unit tests for the DJI-protocol Transporter.
+// These replace the original PX4/COBS tests which are no longer applicable.
 
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
-#include <memory>
-#include <stdexcept>
-#include <string>
+#include <vector>
 
-#include <linux/memfd.h>
-
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <gtest/gtest.h>
 
 #include "ros2_serial_example/transporter.hpp"
 
-/// HELPERS
+// ── Concrete in-process transporter for testing ──────────────────────────────
+// node_write() captures bytes into a vector so tests can inspect the wire data.
+// node_read() pushes a pre-loaded rx_data_ vector into the ring buffer.
 
-static inline int memfd_create(const char *name, unsigned int flags)
-{
-    return syscall(__NR_memfd_create, name, flags);
-}
-
-class TransporterPassThrough : public ros2_to_serial_bridge::transport::Transporter
+class TransporterPassThrough final : public ros2_to_serial_bridge::transport::Transporter
 {
 public:
-    TransporterPassThrough(const std::string & protocol, size_t ring_buffer_size) : Transporter(protocol, ring_buffer_size)
-    {
-    }
+    explicit TransporterPassThrough(size_t ring_buffer_size = 1024)
+    : Transporter(ring_buffer_size) {}
 
-    ~TransporterPassThrough() override
-    {
-    }
+    // Data written by the Transporter's write() path ends up here.
+    std::vector<uint8_t> written_data;
 
-    ssize_t node_read() override
-    {
-        return 0;
-    }
-
-    ssize_t node_write(void *buffer, size_t len) override
-    {
-        (void)buffer;
-        (void)len;
-        return 0;
-    }
-
-    bool fds_OK() override
-    {
-        return true;
-    }
-};
-
-class TransporterFixture : public ros2_to_serial_bridge::transport::Transporter, public testing::Test
-{
-public:
-    TransporterFixture(const std::string & protocol) : Transporter(protocol, 240)
-    {
-        // Setup the memory fd
-        memfd_ = memfd_create(protocol.c_str(), MFD_CLOEXEC);
-        if (memfd_ < 0)
-        {
-            throw std::runtime_error("Failed to create memfd");
-        }
-
-        // The RingBuffer class essentially assumes that this file descriptor
-        // is non-blocking
-        if (::fcntl(memfd_, F_SETFL, O_NONBLOCK) != 0)
-        {
-            ::close(memfd_);
-            throw std::runtime_error("Failed to set memfd nonblocking");
-        }
-    }
-
-    virtual ~TransporterFixture()
-    {
-        ::close(memfd_);
-    }
-
-    // Add some additional data to the memfd.  After this call the file pointer
-    // will be at the start of the new memory.
-    int add_to_memfd(uint8_t *buf, size_t bufsize)
-    {
-        off_t offset = ::lseek(memfd_, 0, SEEK_CUR);
-        if (offset < 0)
-        {
-            return -1;
-        }
-
-        if (::ftruncate(memfd_, offset + bufsize) != 0)
-        {
-            return -1;
-        }
-
-        if (::lseek(memfd_, offset, SEEK_SET) != offset)
-        {
-            return -1;
-        }
-
-        if (::write(memfd_, buf, bufsize) != static_cast<int>(bufsize))
-        {
-            return -1;
-        }
-
-        if (::lseek(memfd_, offset, SEEK_SET) != offset)
-        {
-            return -1;
-        }
-
-        return bufsize;
-    }
-
-    ssize_t node_read() override
-    {
-        return ringbuf_.read(memfd_);
-    }
-
-    ssize_t node_write(void *buffer, size_t len) override
-    {
-        written_data_ = std::unique_ptr<uint8_t[]>(new uint8_t[len]);
-        ::memcpy(written_data_.get(), buffer, len);
-        return len;
-    }
-
-    bool fds_OK() override
-    {
-        return test_fds_ok_;
-    }
+    // Bytes to be fed into the ring buffer on the next node_read() call.
+    std::vector<uint8_t> rx_data;
 
 protected:
-    // This variable is used to hang on to data written by tests so it can be
-    // examined.
-    std::unique_ptr<uint8_t[]> written_data_;
+    ssize_t node_write(void * buffer, size_t len) override
+    {
+        const uint8_t * p = static_cast<const uint8_t *>(buffer);
+        written_data.insert(written_data.end(), p, p + len);
+        return static_cast<ssize_t>(len);
+    }
 
-    // This file descriptor connects to a memory fd which tests can fill with
-    // data of their choosing.  That data will be returned when a test
-    // calls read()
-    int memfd_;
+    ssize_t node_read() override
+    {
+        if (rx_data.empty()) { return 0; }
+        ssize_t n = ringbuf_.write(rx_data.data(), rx_data.size());
+        rx_data.clear();
+        return n;
+    }
 
-    // This variable is used by the tests to control whether fds_OK returns
-    // true or false (true by default)
-    bool test_fds_ok_{true};
+    bool fds_OK() override { return true; }
 };
 
-// This fixture allows us access to the protected methods of Transporter
-class PX4TransporterFixture : public TransporterFixture
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Build a valid DJI frame by hand so we can feed it to find_and_copy_message.
+static std::vector<uint8_t> make_dji_frame(uint16_t msg_type,
+                                            uint8_t seq,
+                                            const std::vector<uint8_t> & payload)
 {
-public:
-    PX4TransporterFixture() : TransporterFixture("px4")
-    {
-    }
-};
+    // Header fields
+    uint8_t  head       = 0xA5;
+    uint16_t dataLength = static_cast<uint16_t>(payload.size());
 
-// This fixture allows us access to the protected methods of Transporter
-class COBSTransporterFixture : public TransporterFixture
-{
-public:
-    COBSTransporterFixture() : TransporterFixture("cobs")
-    {
-    }
-};
+    // Build raw header bytes (head, dataLen_L, dataLen_H, seq) for CRC8
+    uint8_t pre_crc[4];
+    pre_crc[0] = head;
+    pre_crc[1] = static_cast<uint8_t>(dataLength & 0xFF);
+    pre_crc[2] = static_cast<uint8_t>((dataLength >> 8) & 0xFF);
+    pre_crc[3] = seq;
 
-std::vector<uint8_t> setup_px4_test_data()
-{
-    // The amount of data we need is 3 bytes for the marker, plus the size of
-    // the topic id, plus 5 bytes for the sequence, payload, and CRC, plus 4
-    // bytes for the payload.
-    std::vector<uint8_t> test_data(3 + sizeof(topic_id_size_t) + 5 + 4);
+    uint8_t crc8 = calculateCRC8(pre_crc, 4);
 
-    topic_id_size_t topic_ID = 0xa;
-    size_t i = 0;
-    test_data[i++] = '>';  // marker 1
-    test_data[i++] = '>';  // marker 2
-    test_data[i++] = '>';  // marker 3
-    ::memcpy(&test_data[i], &topic_ID, sizeof(topic_id_size_t));  // topic id
-    i += sizeof(topic_id_size_t);
-    test_data[i++] = 0x00;  // sequence number
-    test_data[i++] = 0x00;  // payload length high
-    test_data[i++] = 0x04;  // payload length low
-    test_data[i++] = 0x6d;  // crc high
-    test_data[i++] = 0x10;  // crc low
-    test_data[i++] = 0x05;  // payload 1
-    test_data[i++] = 0x01;  // payload 2
-    test_data[i++] = 0x02;  // payload 3
-    test_data[i++] = 0x03;  // payload 4
+    std::vector<uint8_t> frame;
+    frame.push_back(head);
+    frame.push_back(pre_crc[1]);   // dataLen L
+    frame.push_back(pre_crc[2]);   // dataLen H
+    frame.push_back(seq);
+    frame.push_back(crc8);
+    frame.push_back(static_cast<uint8_t>(msg_type & 0xFF));
+    frame.push_back(static_cast<uint8_t>((msg_type >> 8) & 0xFF));
+    frame.insert(frame.end(), payload.begin(), payload.end());
 
-    return test_data;
+    uint16_t crc16 = calculateCRC16(frame.data(), frame.size());
+    frame.push_back(static_cast<uint8_t>(crc16 & 0xFF));
+    frame.push_back(static_cast<uint8_t>((crc16 >> 8) & 0xFF));
+    return frame;
 }
 
-std::vector<uint8_t> setup_cobs_test_data()
+// ── Tests: Transporter::write() (TX path) ─────────────────────────────────────
+
+TEST(TransporterWrite, EmptyPayload)
 {
-    // // The amount of data we need is 4 bytes for the header, plus the size of
-    // // the topic id, plus one byte for the final 0, plus 4 bytes for the payload.
-    // std::vector<uint8_t> test_data(4 + sizeof(topic_id_size_t) + 1 + 4);
-    // topic_id_size_t topic_ID = 0xa;
-    // size_t i = 0;
+    TransporterPassThrough t;
+    ssize_t ret = t.write(42, nullptr, 0);
+    ASSERT_EQ(ret, 0);
 
-    if (sizeof(topic_id_size_t) == 1)
-    {
-        return std::vector<uint8_t>{
-            0x2, 0xa, 0x8, 0x4, 0x6d, 0x10, 0x5, 0x1, 0x2, 0x3, 0x0,
-        };
-    }
-    else if (sizeof(topic_id_size_t) == 2)
-    {
-        return std::vector<uint8_t>{
-            0x2, 0xa, 0x1, 0x8, 0x4, 0x6d, 0x10, 0x5, 0x1, 0x2, 0x3, 0x0,
-        };
-    }
-
-    throw std::runtime_error("Invalid topic ID size");
+    // Frame should be 7 (header) + 0 (payload) + 2 (CRC16) = 9 bytes
+    ASSERT_EQ(t.written_data.size(), 9u);
+    ASSERT_EQ(t.written_data[0], 0xA5u);  // SOF
 }
 
-TEST(TransporterPassThrough, px4_protocol)
+TEST(TransporterWrite, SmallPayload)
 {
-    TransporterPassThrough trans("px4", 1024);
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0x01, 0x02, 0x03, 0x04};
+    ssize_t ret = t.write(7, payload.data(), payload.size());
+    ASSERT_EQ(ret, static_cast<ssize_t>(payload.size()));
 
-    ASSERT_EQ(trans.init(), 0);
+    // Total: 7 + 4 + 2 = 13 bytes
+    ASSERT_EQ(t.written_data.size(), 13u);
+    ASSERT_EQ(t.written_data[0], 0xA5u);
 
-    ASSERT_EQ(trans.close(), 0);
+    // dataLength field (bytes 1-2, LE) == 4
+    uint16_t dlen = static_cast<uint16_t>(t.written_data[1]) |
+                    (static_cast<uint16_t>(t.written_data[2]) << 8);
+    ASSERT_EQ(dlen, 4u);
+
+    // msgType field (bytes 5-6, LE) == 7
+    uint16_t mtype = static_cast<uint16_t>(t.written_data[5]) |
+                     (static_cast<uint16_t>(t.written_data[6]) << 8);
+    ASSERT_EQ(mtype, 7u);
 }
 
-TEST(TransporterPassThrough, cobs_protocol)
+TEST(TransporterWrite, CRC8IsValid)
 {
-    TransporterPassThrough trans("cobs", 1024);
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF};
+    t.write(1, payload.data(), payload.size());
 
-    ASSERT_EQ(trans.init(), 0);
-
-    ASSERT_EQ(trans.close(), 0);
+    const auto & d = t.written_data;
+    // CRC8 should cover first 4 bytes (head, dataLen_L, dataLen_H, seq)
+    uint8_t expected_crc8 = calculateCRC8(d.data(), 4);
+    ASSERT_EQ(d[4], expected_crc8);
 }
 
-TEST(TransporterPassThrough, invalid_protocol)
+TEST(TransporterWrite, CRC16IsValid)
 {
-    try
-    {
-        TransporterPassThrough trans("foo", 1024);
-    }
-    catch (const std::runtime_error & e)
-    {
-        if (std::string(e.what()).find("Invalid protocol") == std::string::npos)
-        {
-          FAIL() << "Expected error msg containing: Invalid protocol" << std::endl
-                 << "Saw error msg: " << std::endl
-                 << e.what() << std::endl;
-        }
-    }
-    catch (const std::exception & e)
-    {
-      FAIL() << "Expected exception of type " "std::runtime_error" << std::endl
-             << "Saw exception of type: " << typeid(e).name() << std::endl;
-    }
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0x11, 0x22, 0x33};
+    t.write(5, payload.data(), payload.size());
+
+    const auto & d = t.written_data;
+    size_t frame_body_len = d.size() - 2;  // everything before CRC16 bytes
+    uint16_t expected_crc16 = calculateCRC16(d.data(), frame_body_len);
+    uint16_t written_crc16 = static_cast<uint16_t>(d[frame_body_len]) |
+                             (static_cast<uint16_t>(d[frame_body_len + 1]) << 8);
+    ASSERT_EQ(written_crc16, expected_crc16);
 }
 
-TEST_F(PX4TransporterFixture, get_header_length)
+TEST(TransporterWrite, SequenceIncrements)
 {
-    ASSERT_EQ(get_header_length(), sizeof(topic_id_size_t) + 8U);
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0x00};
+    t.write(1, payload.data(), payload.size());
+    t.write(1, payload.data(), payload.size());
+    t.write(1, payload.data(), payload.size());
+
+    // seq is byte 3 of each 10-byte frame (7 hdr + 1 payload + 2 crc)
+    ASSERT_EQ(t.written_data[3],  0u);
+    ASSERT_EQ(t.written_data[13], 1u);
+    ASSERT_EQ(t.written_data[23], 2u);
 }
 
-TEST_F(PX4TransporterFixture, crc16_byte)
+// ── Tests: Transporter::read() (RX path) ──────────────────────────────────────
+
+TEST(TransporterRead, ValidFrame)
 {
-    ASSERT_EQ(crc16_byte(0, 0), 0);
-    ASSERT_EQ(crc16_byte(0, 1), 0xc0c1);
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0xAA, 0xBB, 0xCC};
+    uint16_t msg_type = 3;
+
+    t.rx_data = make_dji_frame(msg_type, 0, payload);
+
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_EQ(len, static_cast<ssize_t>(payload.size()));
+    ASSERT_EQ(topic_id, msg_type);
+    ASSERT_EQ(out[0], 0xAAu);
+    ASSERT_EQ(out[1], 0xBBu);
+    ASSERT_EQ(out[2], 0xCCu);
 }
 
-TEST_F(PX4TransporterFixture, crc16)
+TEST(TransporterRead, EmptyPayloadFrame)
 {
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
+    TransporterPassThrough t;
+    t.rx_data = make_dji_frame(99, 7, {});
 
-    ASSERT_EQ(crc16(buf.get(), 4), 0);
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_EQ(len, 0);
+    ASSERT_EQ(topic_id, 99u);
 }
 
-TEST_F(PX4TransporterFixture, write_fds_not_ok)
+TEST(TransporterRead, GarbageBeforeSOF)
 {
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
+    TransporterPassThrough t;
+    std::vector<uint8_t> payload = {0x42};
+    auto frame = make_dji_frame(2, 0, payload);
 
-    test_fds_ok_ = false;
-    ASSERT_EQ(write(0, buf.get(), 4), -1);
+    // Prepend garbage bytes
+    t.rx_data.insert(t.rx_data.end(), {0x00, 0xFF, 0x12, 0x34});
+    t.rx_data.insert(t.rx_data.end(), frame.begin(), frame.end());
+
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_EQ(len, 1);
+    ASSERT_EQ(topic_id, 2u);
+    ASSERT_EQ(out[0], 0x42u);
 }
 
-TEST_F(PX4TransporterFixture, write_nullptr)
+TEST(TransporterRead, BadCRC8Rejected)
 {
-    ASSERT_EQ(write(0, nullptr, 0), 0);
+    TransporterPassThrough t;
+    auto frame = make_dji_frame(1, 0, {0x01, 0x02});
+
+    // Corrupt the CRC8 byte (index 4)
+    frame[4] ^= 0xFF;
+    t.rx_data = frame;
+
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_LT(len, 0);
 }
 
-TEST_F(PX4TransporterFixture, write_zero_data)
+TEST(TransporterRead, BadCRC16Rejected)
 {
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-    ASSERT_EQ(write(0, buf.get(), 0), -1);
+    TransporterPassThrough t;
+    auto frame = make_dji_frame(1, 0, {0x01, 0x02});
+
+    // Corrupt the last byte (CRC16 MSB)
+    frame.back() ^= 0xFF;
+    t.rx_data = frame;
+
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_LT(len, 0);
 }
 
-TEST_F(PX4TransporterFixture, write_nullptr_with_length)
+TEST(TransporterRead, PartialFrameReturnsNoData)
 {
-    ASSERT_EQ(write(0, nullptr, 4), -1);
+    TransporterPassThrough t;
+    auto frame = make_dji_frame(5, 0, {0xDE, 0xAD, 0xBE, 0xEF});
+
+    // Feed only the header (no payload, no CRC16)
+    t.rx_data.assign(frame.begin(), frame.begin() + 7);
+
+    uint8_t out[64];
+    topic_id_size_t topic_id = 0xFFFF;
+    ssize_t len = t.read(&topic_id, out, sizeof(out));
+
+    ASSERT_LT(len, 0);  // -ENODATA
 }
 
-TEST_F(PX4TransporterFixture, write)
+TEST(TransporterRead, TwoConsecutiveFrames)
 {
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-    buf.get()[0] = 0x5;
-    buf.get()[1] = 0x1;
-    buf.get()[2] = 0x2;
-    buf.get()[3] = 0x3;
+    TransporterPassThrough t;
+    auto frame1 = make_dji_frame(10, 0, {0x01});
+    auto frame2 = make_dji_frame(20, 1, {0x02, 0x03});
 
-    ASSERT_EQ(write(0xa, buf.get(), 4), 4);
+    t.rx_data.insert(t.rx_data.end(), frame1.begin(), frame1.end());
+    t.rx_data.insert(t.rx_data.end(), frame2.begin(), frame2.end());
 
-    std::vector<uint8_t> expected = setup_px4_test_data();
-
-    for (size_t i = 0; i < expected.size(); ++i)
-    {
-        ASSERT_EQ(written_data_.get()[i], expected[i]);
-    }
-}
-
-TEST_F(PX4TransporterFixture, read_null_topic_id)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-    ASSERT_EQ(read(nullptr, buf.get(), 4), -1);
-}
-
-TEST_F(PX4TransporterFixture, read_null_buffer)
-{
+    uint8_t out[64];
     topic_id_size_t topic_id;
-    ASSERT_EQ(read(&topic_id, nullptr, 4), -1);
+
+    ssize_t len1 = t.read(&topic_id, out, sizeof(out));
+    ASSERT_EQ(len1, 1);
+    ASSERT_EQ(topic_id, 10u);
+    ASSERT_EQ(out[0], 0x01u);
+
+    ssize_t len2 = t.read(&topic_id, out, sizeof(out));
+    ASSERT_EQ(len2, 2);
+    ASSERT_EQ(topic_id, 20u);
+    ASSERT_EQ(out[0], 0x02u);
+    ASSERT_EQ(out[1], 0x03u);
 }
 
-TEST_F(PX4TransporterFixture, read_fds_not_ok)
+// ── Tests: round-trip write → read ────────────────────────────────────────────
+
+TEST(TransporterRoundTrip, WriteAndReadBack)
 {
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
+    TransporterPassThrough tx;
+    TransporterPassThrough rx;
+
+    std::vector<uint8_t> payload = {0x10, 0x20, 0x30, 0x40, 0x50};
+    uint16_t msg_type = 42;
+
+    tx.write(msg_type, payload.data(), payload.size());
+
+    // Feed the bytes tx produced directly into rx's receive path
+    rx.rx_data = tx.written_data;
+
+    uint8_t out[64];
     topic_id_size_t topic_id;
+    ssize_t len = rx.read(&topic_id, out, sizeof(out));
 
-    test_fds_ok_ = false;
-    ASSERT_EQ(read(&topic_id, buf.get(), 4), -1);
-}
-
-TEST_F(PX4TransporterFixture, read_message)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-
-    std::vector<uint8_t> read_data = setup_px4_test_data();
-
-    add_to_memfd(&read_data[0], read_data.size());
-
-    topic_id_size_t topic_id;
-    ASSERT_EQ(read(&topic_id, buf.get(), 4), 4);
-    ASSERT_EQ(topic_id, 0xa);
-    ASSERT_EQ(buf.get()[0], 0x05);
-    ASSERT_EQ(buf.get()[1], 0x01);
-    ASSERT_EQ(buf.get()[2], 0x02);
-    ASSERT_EQ(buf.get()[3], 0x03);
-}
-
-TEST_F(PX4TransporterFixture, read_message_already_available)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-
-    std::vector<uint8_t> read_data = setup_px4_test_data();
-
-    add_to_memfd(&read_data[0], read_data.size());
-    ASSERT_EQ(node_read(), static_cast<ssize_t>(read_data.size()));
-
-    topic_id_size_t topic_id;
-    ASSERT_EQ(read(&topic_id, buf.get(), 4), 4);
-    ASSERT_EQ(topic_id, 0xa);
-    ASSERT_EQ(buf.get()[0], 0x05);
-    ASSERT_EQ(buf.get()[1], 0x01);
-    ASSERT_EQ(buf.get()[2], 0x02);
-    ASSERT_EQ(buf.get()[3], 0x03);
-}
-
-TEST_F(COBSTransporterFixture, get_header_length)
-{
-    ASSERT_EQ(get_header_length(), sizeof(topic_id_size_t) + 4U);
-}
-
-TEST_F(COBSTransporterFixture, write)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-    buf.get()[0] = 0x5;
-    buf.get()[1] = 0x1;
-    buf.get()[2] = 0x2;
-    buf.get()[3] = 0x3;
-
-    ASSERT_EQ(write(0xa, buf.get(), 4), 4);
-
-    std::vector<uint8_t> expected = setup_cobs_test_data();
-
-    for (size_t i = 0; i < expected.size(); ++i)
+    ASSERT_EQ(len, static_cast<ssize_t>(payload.size()));
+    ASSERT_EQ(topic_id, msg_type);
+    for (size_t i = 0; i < payload.size(); ++i)
     {
-        ASSERT_EQ(written_data_.get()[i], expected[i]);
+        ASSERT_EQ(out[i], payload[i]) << "mismatch at byte " << i;
     }
 }
 
-std::vector<uint8_t> setup_cobs_long_data()
+TEST(TransporterRoundTrip, LargePayload)
 {
-    if (sizeof(topic_id_size_t) == 1)
-    {
-        std::vector<uint8_t> test_data{
-            0xff, 0xa, 0x1, 0x2c, 0xb6, 0x4a
-        };
+    TransporterPassThrough tx;
+    TransporterPassThrough rx(16384);
 
-        size_t header_size = test_data.size();
+    std::vector<uint8_t> payload(512);
+    for (size_t i = 0; i < payload.size(); ++i) { payload[i] = static_cast<uint8_t>(i & 0xFF); }
 
-        test_data.resize(header_size + 300 + 1 + 1);
-        test_data[test_data.size() - 1] = 0x0;
+    tx.write(7, payload.data(), payload.size());
+    rx.rx_data = tx.written_data;
 
-        for (size_t i = header_size; i < test_data.size() - 1; ++i)
-        {
-            test_data[i] = 0x1;
-        }
-
-        test_data[255] = 0x34;
-
-        return test_data;
-    }
-    else if (sizeof(topic_id_size_t) == 2)
-    {
-        std::vector<uint8_t> test_data{
-            0x2, 0xa, 0xff, 0x1, 0x2c, 0xb6, 0x4a
-        };
-
-        size_t header_size = test_data.size();
-
-        test_data.resize(header_size + 300 + 1 + 1);
-        test_data[test_data.size() - 1] = 0x0;
-
-        for (size_t i = header_size; i < test_data.size() - 1; ++i)
-        {
-            test_data[i] = 0x1;
-        }
-
-        test_data[257] = 0x33;
-
-        return test_data;
-    }
-
-    throw std::runtime_error("Unsupported topic_id_size_t size");
-}
-
-TEST_F(COBSTransporterFixture, write_long_sequence)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[300]{});
-    for (size_t i = 0; i < 300; ++i)
-    {
-        buf[i] = 0x1;
-    }
-
-    ASSERT_EQ(write(0xa, buf.get(), 300), 300);
-
-    std::vector<uint8_t> expected = setup_cobs_long_data();
-
-    for (size_t i = 0; i < expected.size(); ++i)
-    {
-        ASSERT_EQ(written_data_.get()[i], expected[i]);
-    }
-}
-
-TEST_F(COBSTransporterFixture, read_message)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-
-    std::vector<uint8_t> read_data = setup_cobs_test_data();
-    add_to_memfd(&read_data[0], read_data.size());
-
+    std::vector<uint8_t> out(payload.size());
     topic_id_size_t topic_id;
-    ASSERT_EQ(read(&topic_id, buf.get(), 4), 4);
-    ASSERT_EQ(topic_id, 0xa);
-    ASSERT_EQ(buf.get()[0], 0x05);
-    ASSERT_EQ(buf.get()[1], 0x01);
-    ASSERT_EQ(buf.get()[2], 0x02);
-    ASSERT_EQ(buf.get()[3], 0x03);
-}
+    ssize_t len = rx.read(&topic_id, out.data(), out.size());
 
-TEST_F(COBSTransporterFixture, read_message_already_available)
-{
-    std::unique_ptr<uint8_t[]> buf = std::unique_ptr<uint8_t[]>(new uint8_t[4]{});
-
-    std::vector<uint8_t> read_data = setup_cobs_test_data();
-    add_to_memfd(&read_data[0], read_data.size());
-
-    ASSERT_EQ(node_read(), static_cast<ssize_t>(read_data.size()));
-
-    topic_id_size_t topic_id;
-    ASSERT_EQ(read(&topic_id, buf.get(), 4), 4);
-    ASSERT_EQ(topic_id, 0xa);
-    ASSERT_EQ(buf.get()[0], 0x05);
-    ASSERT_EQ(buf.get()[1], 0x01);
-    ASSERT_EQ(buf.get()[2], 0x02);
-    ASSERT_EQ(buf.get()[3], 0x03);
+    ASSERT_EQ(len, static_cast<ssize_t>(payload.size()));
+    ASSERT_EQ(topic_id, 7u);
+    ASSERT_EQ(out, payload);
 }

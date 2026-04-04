@@ -93,6 +93,7 @@ add_library(ring_buffer
 
 add_library(transporter
   src/transporter.cpp
+  src/crc_dji.cpp       # DJI CRC8/CRC16 lookup-table implementation
 )
 target_link_libraries(transporter
   ring_buffer

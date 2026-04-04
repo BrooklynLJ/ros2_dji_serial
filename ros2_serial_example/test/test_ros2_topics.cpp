@@ -14,7 +14,7 @@
 class TransporterPassThrough : public ros2_to_serial_bridge::transport::Transporter
 {
 public:
-    TransporterPassThrough(const std::string & protocol, size_t ring_buffer_size) : Transporter(protocol, ring_buffer_size)
+    explicit TransporterPassThrough(size_t ring_buffer_size = 8192) : Transporter(ring_buffer_size)
     {
     }
 
@@ -63,7 +63,7 @@ public:
 TEST(ROS2Topics, nullnode)
 {
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
 
     try
     {
@@ -113,7 +113,7 @@ TEST(ROS2Topics, nulltransport)
 TEST(ROS2Topics, duplicate_pub_mapping)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -149,7 +149,7 @@ TEST(ROS2Topics, duplicate_pub_mapping)
 TEST(ROS2Topics, duplicate_sub_mapping)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -185,7 +185,7 @@ TEST(ROS2Topics, duplicate_sub_mapping)
 TEST(ROS2Topics, invalid_type)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -204,7 +204,7 @@ TEST(ROS2Topics, invalid_type)
 TEST(ROS2Topics, invalid_serial_mapping)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -223,7 +223,7 @@ TEST(ROS2Topics, invalid_serial_mapping)
 TEST(ROS2Topics, invalid_direction)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -242,7 +242,7 @@ TEST(ROS2Topics, invalid_direction)
 TEST(ROS2Topics, reserved_serial_mapping0)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -262,7 +262,7 @@ TEST(ROS2Topics, reserved_serial_mapping0)
 TEST(ROS2Topics, reserved_serial_mapping1)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -282,7 +282,7 @@ TEST(ROS2Topics, reserved_serial_mapping1)
 TEST(ROS2Topics, serial_mapping_too_large)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -302,7 +302,7 @@ TEST(ROS2Topics, serial_mapping_too_large)
 TEST(ROS2Topics, unsupported_pub_type)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -322,7 +322,7 @@ TEST(ROS2Topics, unsupported_pub_type)
 TEST(ROS2Topics, unsupported_sub_type)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -342,7 +342,7 @@ TEST(ROS2Topics, unsupported_sub_type)
 TEST(ROS2Topics, one_pub_mapping)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["foo"] = ros2_to_serial_bridge::pubsub::TopicMapping();
@@ -362,7 +362,7 @@ TEST(ROS2Topics, one_pub_mapping)
 TEST(ROS2Topics, one_sub_mapping)
 {
     std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("node");
-    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>("px4", 8192);
+    std::unique_ptr<TransporterPassThrough> transporter = std::make_unique<TransporterPassThrough>(8192);
     std::map<std::string, ros2_to_serial_bridge::pubsub::TopicMapping> topic_names_and_serialization;
 
     topic_names_and_serialization["bar"] = ros2_to_serial_bridge::pubsub::TopicMapping();

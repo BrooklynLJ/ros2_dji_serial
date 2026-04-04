@@ -63,8 +63,6 @@ public:
      * Construct a UARTTransporter object with the given UART parameters.
      *
      * @param[in] uart_name The full path to the device to connect to.
-     * @param[in] protocol The backend protocol to use; see Transporter docs for
-     *                     more information about supported protocols.
      * @param[in] baudrate The baudrate to set the UART to.  This must be a
      *                     number in bits-per-second.
      * @param[in] read_poll_ms The amount of time to wait for the read file
@@ -80,7 +78,6 @@ public:
      *                             memory.  It is recommended to start with 8192.
      */
     UARTTransporter(const std::string & uart_name,
-                    const std::string & protocol,
                     uint32_t baudrate,
                     uint32_t read_poll_ms,
                     size_t ring_buffer_size);

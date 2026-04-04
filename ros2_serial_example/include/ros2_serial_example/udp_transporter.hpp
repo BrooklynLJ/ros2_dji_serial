@@ -80,8 +80,7 @@ public:
      *                             expense of memory.  It is recommended to
      *                             start with 8192.
      */
-    UDPTransporter(const std::string & protocol,
-                   uint16_t recv_port,
+    UDPTransporter(uint16_t recv_port,
                    uint16_t send_port,
                    uint32_t read_poll_ms,
                    size_t ring_buffer_size);

@@ -39,9 +39,7 @@ static void usage(const char *name)
     ::printf("Usage: %s [options]\n\n"
              "  -e <port>     UDP send port; must be specified\n"
              "  -h            Print this help message\n"
-             "  -r <port>     UDP receive port; must be specified\n"
-             "  -s <protocol> Serial protocol to use; currently supported are\n"
-             "                'cobs' (default) and 'px4'\n",
+             "  -r <port>     UDP receive port; must be specified\n",
              name);
 }
 
@@ -113,10 +111,10 @@ int main(int argc, char *argv[])
 {
     uint16_t send_port{0};
     uint16_t recv_port{0};
-    std::string serial_protocol{"cobs"};
+
 
     int ch;
-    while ((ch = ::getopt(argc, argv, "e:hr:s:")) != EOF)
+    while ((ch = ::getopt(argc, argv, "e:hr:")) != EOF)
     {
         switch (ch)
         {
@@ -159,12 +157,7 @@ int main(int argc, char *argv[])
                 }
             }
             break;
-        case 's':
-            if (optarg != nullptr)
-            {
-                serial_protocol = optarg;
-            }
-            break;
+
         default:
             usage(argv[0]);
             return 1;
@@ -177,7 +170,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::unique_ptr<ros2_to_serial_bridge::transport::Transporter> transporter = std::make_unique<ros2_to_serial_bridge::transport::UDPTransporter>(serial_protocol, recv_port, send_port, 100, 8192);
+    std::unique_ptr<ros2_to_serial_bridge::transport::Transporter> transporter = std::make_unique<ros2_to_serial_bridge::transport::UDPTransporter>(recv_port, send_port, 100, 8192);
 
     if (transporter->init() < 0)
     {
